@@ -1,0 +1,252 @@
+-- шаг 2. ETL процедура инкрементной загрузки для устранения дубликатов
+-- шаг 2.1. Создание ETL таблиц
+create schema if not exists kdz_7_etl;
+drop table if exists kdz_7_etl.load_flights;
+create table if not exists kdz_7_etl.load_flights (
+		loaded_ts timestamp not null
+);
+​
+drop table if exists kdz_7_etl.load_weather;
+create table if not exists kdz_7_etl.load_weather (
+		loaded_ts timestamp not null
+);
+
+-- шаг 2.2. ETL процедура для отбора данных по времени
+drop table if exists kdz_7_etl.load_min_max_flights;
+create table if not exists kdz_7_etl.load_min_max_flights as 
+select
+		min(loaded_ts) as ts1
+	,	max(loaded_ts) as ts2 
+from kdz_7_src.flights
+where loaded_ts > coalesce((select max(loaded_ts) from kdz_7_etl.load_flights), '1970-01-01')
+;
+
+select *
+from kdz_7_etl.load_min_max_flights
+;
+
+drop table if exists kdz_7_etl.load_min_max_weather;
+create table if not exists kdz_7_etl.load_min_max_weather as 
+select
+		min(loaded_ts) as ts1
+	,	max(loaded_ts) as ts2 
+from kdz_7_src.weather
+where loaded_ts > coalesce((select max(loaded_ts) from kdz_7_etl.load_weather), '1970-01-01')
+;
+
+select *
+from kdz_7_etl.load_min_max_weather
+;
+
+drop table if exists kdz_7_etl.flights;
+create table if not exists kdz_7_etl.flights as 
+select distinct
+	cast(flight_year as int) as flight_year,
+	cast(flight_quarter as int) as flight_quarter,
+	cast(flight_month as int) as flight_month,
+	to_date(flight_date, 'M/DD/YYYY HH:MI:SS AM') as flight_date,
+	reporting_airline,
+	tail_number,
+	cast(flight_number as int) as flight_number,
+	origin,
+	destination,
+	to_timestamp(crs_dep_time, 'HH24MI')::time as crs_dep_time,
+	to_timestamp(dep_time, 'HH24MI')::time as dep_time,
+	cast(dep_delay_min as float) as dep_delay_min,
+	cast(cancelled as int) as cancelled,
+	cancellation_code,
+	cast(air_time as float) as air_time,
+	cast(distance as float) as distance,
+	cast(weather_delay as float) as weather_delay
+from kdz_7_src.flights, kdz_7_etl.load_min_max_flights
+where 1=1
+and loaded_ts between ts1 and ts2
+;
+
+select *
+from kdz_7_etl.flights
+;
+
+drop table if exists kdz_7_etl.weather;
+create table if not exists kdz_7_etl.weather as 
+select distinct
+	icao_code,
+	to_timestamp(local_datetime, 'DD.MM.YYYY HH24:MI:SS') as local_datetime,
+	cast(air_temp as float) as air_temp,
+	cast(p0_station_lvl as float) as p0_station_lvl,
+	cast(p_sea_lvl as float) as p_sea_lvl,
+	cast(humidity as int) as humidity,
+	wind_direction,
+	cast(wind_speed as int) as wind_speed,
+	cast(max_gust_speed as int) as max_gust_speed,
+	phenomena_observed,
+	phenomena_significant,
+	total_cloud_cover,
+	cast(visibility as float) as visibility,
+	cast(dewpoint_temp as float) as dewpoint_temp
+from kdz_7_src.weather, kdz_7_etl.load_min_max_weather
+where 1=1	
+and loaded_ts between ts1 and ts2
+and dewpoint_temp not like '%(%'
+and visibility not like '%(%'
+;
+
+select *
+from kdz_7_etl.weather
+;
+
+-- шаг 2.3. Создание таблиц staging
+create schema if not exists kdz_7_staging;
+drop table if exists kdz_7_staging.flights;
+create table kdz_7_staging.flights(
+	flight_year int not null,
+	flight_quarter int not null,
+	flight_month int not null,
+	flight_date date not null,
+	reporting_airline varchar(5) not null,
+	tail_number varchar(10) null,
+	flight_number int null,
+	origin varchar(5) not null,
+	destination varchar(5) not null,
+	crs_dep_time time not null,
+	dep_time time null,
+	dep_delay_min float null,
+	cancelled int not null,
+	cancellation_code char(1) null,
+	air_time float null,
+	distance float not null,
+	weather_delay float null,
+	loaded_ts timestamp not null default now(),
+	primary key (flight_date, flight_number, origin, destination, crs_dep_time)
+)
+;
+
+drop table if exists kdz_7_staging.weather;
+create table kdz_7_staging.weather(
+	icao_code varchar(10) default 'PANC',
+	local_datetime timestamp not null primary key,
+	air_temp float not null,
+	p0_station_lvl float not null,
+	p_sea_lvl float not null,
+	humidity int not null,
+	wind_direction varchar(100) null,
+	wind_speed int null,
+	max_gust_speed int null,
+	phenomena_observed varchar(50) null,
+	phenomena_significant varchar(50) null,
+	total_cloud_cover varchar(1000) not null,
+	visibility float not null,
+	dewpoint_temp float not null,
+	loaded_ts timestamp not null default now()
+)
+; 
+
+-- шаг 2.4. Загрузка данных на уровень staging
+insert into kdz_7_staging.flights (flight_year, flight_quarter, flight_month, flight_date, reporting_airline, tail_number, flight_number, origin, destination, crs_dep_time, dep_time, dep_delay_min, cancelled, cancellation_code, air_time, distance, weather_delay)
+	select distinct
+		flight_year,
+		flight_quarter,
+		flight_month,
+		flight_date,
+		reporting_airline,
+		tail_number,
+		flight_number,
+		origin,
+		destination,
+		crs_dep_time,
+		dep_time,
+		dep_delay_min,
+		cancelled,
+		cancellation_code,
+		air_time,
+		distance,
+		weather_delay
+	from kdz_7_etl.flights
+	on conflict (flight_date, flight_number, origin, destination, crs_dep_time) do update
+	set
+		flight_year = excluded.flight_year,
+		flight_quarter = excluded.flight_quarter,
+		flight_month = excluded.flight_month,
+		reporting_airline = excluded.reporting_airline,
+		tail_number = excluded.tail_number,
+		dep_time = excluded.dep_time,
+		dep_delay_min = excluded.dep_delay_min,
+		cancelled = excluded.cancelled,
+		cancellation_code = excluded.cancellation_code,
+		air_time = excluded.air_time,
+		distance = excluded.distance,
+		weather_delay = excluded.weather_delay,
+		loaded_ts = now()
+;
+
+select *
+from kdz_7_staging.flights
+;
+
+insert into kdz_7_staging.weather (icao_code, local_datetime, air_temp, p0_station_lvl, p_sea_lvl, humidity, wind_direction, wind_speed, max_gust_speed, phenomena_observed, phenomena_significant, total_cloud_cover, visibility, dewpoint_temp )
+	select
+		icao_code,
+		local_datetime,
+		air_temp,
+		p0_station_lvl,
+		p_sea_lvl,
+		humidity,
+		wind_direction,
+		wind_speed,
+		max_gust_speed,
+		phenomena_observed,
+		phenomena_significant,
+		total_cloud_cover,
+		visibility,
+		dewpoint_temp 
+	from kdz_7_etl.weather
+	on conflict (local_datetime) do update
+	set
+		icao_code = excluded.icao_code,
+		air_temp = excluded.air_temp,
+		p0_station_lvl = excluded.p0_station_lvl,
+		p_sea_lvl = excluded.p_sea_lvl,
+		humidity = excluded.humidity,
+		wind_direction = excluded.wind_direction,
+		wind_speed = excluded.wind_speed,
+		max_gust_speed = excluded.max_gust_speed,
+		phenomena_observed = excluded.phenomena_observed,
+		phenomena_significant = excluded.phenomena_significant,
+		total_cloud_cover = excluded.total_cloud_cover,
+		visibility = excluded.visibility,
+		dewpoint_temp = excluded.dewpoint_temp,
+		loaded_ts = now()
+;
+
+select *
+from kdz_7_staging.weather
+;
+
+--шаг 2.5. Обновление времени загрузки данных
+delete from kdz_7_etl.load_flights 
+where exists (select 1 from kdz_7_etl.load_flights)
+;
+
+insert into kdz_7_etl.load_flights (loaded_ts)
+	select ts2
+	from kdz_7_etl.load_min_max_flights
+	where exists (select 1 from kdz_7_etl.load_min_max_flights)
+;
+
+select *
+from kdz_7_etl.load_flights
+;
+
+delete from kdz_7_etl.load_weather
+where exists (select 1 from kdz_7_etl.load_weather)
+;
+
+insert into kdz_7_etl.load_weather (loaded_ts)
+	select ts2
+	from kdz_7_etl.load_min_max_weather
+	where exists (select 1 from kdz_7_etl.load_min_max_weather)
+;
+
+select *
+from kdz_7_etl.load_weather
+;
