@@ -1,0 +1,50 @@
+drop table if exists kdz_7_etl.fact_departure_etl
+create table kdz_7_etl.fact_departure_etl as
+with flights as (
+		Select t1.* 
+		from kdz_7_dds.flights t1
+		join (Select max(loaded_ts) loaded_ts from kdz_7_dds.flights) t2
+		on t1.loaded_ts=t2.loaded_ts
+		),
+	weather as (
+		Select t1.* from kdz_7_dds.airport_weather t1
+		join (Select max(loaded_ts) loaded_ts from kdz_7_dds.airport_weather) t2
+		on t1.loaded_ts=t2.loaded_ts
+		)			
+	select
+		t1.airport_origin_dk,
+		t1.airport_dest_dk as airport_destination_dk,
+		coalesce(t2.weather_type_dk, t3.weather_type_dk) as weather_type_dk,
+		t1.flight_dep_scheduled_ts as flight_scheduled_ts,
+		t1.flight_actual_date,
+		t1.flight_number_reporting_airline as flight_number,
+		t1.distance,
+		t1.tail_number,
+		t1.report_airline as airline,
+		t1.dep_delay_minutes as dep_delay_min,
+		t1.cancelled,
+		t1.cancellation_code,
+		coalesce(t2.t, t3.t) as t,
+		coalesce(t2.max_gws,t3.max_gws) as max_gws,
+		coalesce(t2.w_speed, t3.w_speed) as w_speed,
+		t1.air_time,
+		'7' as author,
+		current_timestamp as loaded_ts
+	from flights t1
+	left join weather t2
+	on t1.airport_origin_dk = t2.airport_dk 
+	and (t1.flight_dep_scheduled_ts >= t2.date_start and  t1.flight_dep_scheduled_ts < t2.date_end)
+	left join weather t3
+	on t1.airport_dest_dk = t3.airport_dk 
+	and (t1.flight_dep_scheduled_ts >= t3.date_start and  t1.flight_dep_scheduled_ts < t3.date_end)
+
+select * from kdz_7_etl.fact_departure_etl
+	
+create table kdz_7_etl.test_dep as
+select * from mart.fact_departure where 1<0
+
+insert into kdz_7_etl.test_dep
+(select * from kdz_7_etl.fact_departure_etl) on conflict do nothing
+
+insert into mart.fact_departure
+(select * from kdz_7_etl.fact_departure_etl) on conflict do nothing
